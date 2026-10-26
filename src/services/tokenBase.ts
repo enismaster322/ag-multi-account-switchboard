@@ -305,10 +305,15 @@ export class TokenBaseService {
                 if (raw.length < before) {
                     log.warn(`Workspace context: filtered ${before - raw.length} items from other workspace(s)`);
                 }
-                if (raw.length === 0) {
+                // Only bail when items existed but ALL belonged to another workspace (wrong LS)
+                if (before > 0 && raw.length === 0) {
                     log.warn('Workspace context: all items filtered — likely wrong LS, returning null');
                     return null;
                 }
+            }
+
+            if (raw.length === 0) {
+                log.debug('Workspace context: no agent items in LS scope (cold start indexing or no .agents rules)');
             }
 
             const data = categorizeAgentItems(raw, workspaceName);
