@@ -51,6 +51,7 @@ export class QuotaManager {
     private static readonly POLL_INTERVAL_KEY = 'ag.pollIntervalMs';
     private static readonly CASCADE_ID_LOG_LEN = 12;
     private static readonly POST_SWITCH_REFRESH_DELAY = 2000;
+    private static readonly INITIAL_REFRESH_DELAY_MS = 2500;
     private static readonly DEBOUNCE_MS = 1500;
     /**
      * A message from the webview is only honoured if it names a rate the picker
@@ -95,7 +96,9 @@ export class QuotaManager {
         this.lastContextWindow = null;
         this.lastContextConversationId = null;
         this.context.globalState.update(QuotaManager.CTX_CACHE_KEY, null);
-        this.refresh();
+
+        // Defer initial refresh briefly to allow Language Server to finish booting on cold start
+        setTimeout(() => this.refresh(), QuotaManager.INITIAL_REFRESH_DELAY_MS);
 
         // The only poll. It runs regardless of panel visibility, which is why the
         // footer picker drives THIS timer: a webview-side timer dies when the
