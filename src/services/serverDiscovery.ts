@@ -130,10 +130,15 @@ export class ServerDiscoveryService {
 
     /** macOS / Linux: use ps to find candidates */
     private async findCandidatesUnix(): Promise<{ pid: string; csrfToken: string; wsId?: string; httpsPort?: number }[]> {
-        const { stdout } = await execAsync(
-            `ps -A -ww -o pid,args | grep "${LS_PROCESS_GREP}" | grep -v grep`
-        );
-        return this.parsePsOutput(stdout);
+        try {
+            const { stdout } = await execAsync(
+                `ps -A -ww -o pid,args | grep "${LS_PROCESS_GREP}" | grep -v grep`
+            );
+            return this.parsePsOutput(stdout);
+        } catch {
+            // grep exits with code 1 when no matching process is found (e.g. cold start)
+            return [];
+        }
     }
 
     /** Windows: use PowerShell + wmic fallback to find candidates (with PID) */
