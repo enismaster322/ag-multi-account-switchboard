@@ -11,12 +11,29 @@ import { initPricingCatalog, resolveLiteLlmPricing } from './services/litellmPri
 import { ConversationTracker } from './services/conversationTracker';
 import { ConversationGuard } from './services/conversationGuard';
 import { isSharedConversationStore } from './shared/agPaths';
-import { callLsJson } from './utils/lsClient';
+import { callLsJson, findLSEndpoints } from './utils/lsClient';
 import { initLogger, createLogger, setFileSink, setDiagSink } from './utils/logger';
 
 const log = createLogger('Extension');
 
+const LS_BOOT_TIMEOUT_MS = 8000;
+const LS_BOOT_POLL_INTERVAL_MS = 500;
 
+async function waitForLanguageServer(maxWaitMs = LS_BOOT_TIMEOUT_MS): Promise<boolean> {
+    const start = Date.now();
+    while (Date.now() - start < maxWaitMs) {
+        try {
+            const endpoints = await findLSEndpoints();
+            if (endpoints.length > 0) {
+                log.info(`Readiness probe: LS detected on port=${endpoints[0].port} (${Date.now() - start}ms)`);
+                return true;
+            }
+        } catch { /* ignore transient discovery errors during boot */ }
+        await new Promise(r => setTimeout(r, LS_BOOT_POLL_INTERVAL_MS));
+    }
+    log.info(`Readiness probe: LS not detected within ${maxWaitMs}ms — proceeding anyway`);
+    return false;
+}
 
 export async function activate(context: vscode.ExtensionContext) {
     // Initialize OutputChannel logger FIRST — all modules use this
@@ -25,6 +42,9 @@ export async function activate(context: vscode.ExtensionContext) {
     const tmpDir = os.tmpdir();
     setFileSink(path.join(tmpDir, 'ag-panel.log'));
     setDiagSink(path.join(tmpDir, 'ag-ctx-diag.log'));
+
+    // Wait for Language Server to appear before booting managers
+    await waitForLanguageServer();
 
     // --- Boot managers ---
     const accountManager = new AccountManager(context);
