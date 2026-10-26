@@ -393,9 +393,11 @@ export class AccountSwitchService {
                 } else {
                     log.warn('UserStatus poll iteration failed:', msg);
                 }
+            } finally {
+                if (!emailMatched) {
+                    await delay(intervalMs);
+                }
             }
-
-            await delay(intervalMs);
         }
         log.info(`Polling timed out after ${maxWaitMs}ms (emailMatched=${emailMatched})`);
         return { confirmed: emailMatched };
