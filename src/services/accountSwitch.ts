@@ -102,14 +102,7 @@ export class AccountSwitchService {
                 return { confirmed: false };
             }
 
-            // 1. Instant name/email display via USS
-            await uss.pushSerializedUpdateIPC(this.buildUserStatusUpdate(name, email));
-
-            // 2. Legacy auth status JSON (safe — no SQL injection, async to not block)
-            this.writeAuthStatusToDb(name, email, accessToken);
-
-            // 3. Set OAuth token — triggers internal uss-oauth subscriber
-            //    (but this does NOT call registerGdmUser — see header comment)
+            // 1. Set OAuth token — triggers internal uss-oauth subscriber
             //    CRITICAL: use the REAL expiry timestamp, not a hardcoded +3600.
             //    IDE's google-auth-library uses this to decide when to auto-refresh.
             //    A wrong value causes auto-refresh to miss, leading to 401s.
@@ -121,7 +114,10 @@ export class AccountSwitchService {
                 isGcpTos: false,
             });
 
-            // 4. handleAuthRefresh FIRST — fires IDE's createSession + sessionChangeEmitter.
+            // 2. Legacy auth status JSON (safe — no SQL injection, async to not block)
+            this.writeAuthStatusToDb(name, email, accessToken);
+
+            // 3. handleAuthRefresh — fires IDE's createSession + sessionChangeEmitter.
             //    This propagates the new token context to LS via USS IPC notification,
             //    ensuring LS is aware of the new session BEFORE we call registerGdmUser.
             try {
@@ -131,17 +127,17 @@ export class AccountSwitchService {
                 log.warn('handleAuthRefresh failed (non-fatal):', e?.message);
             }
 
-            // 5. Readiness Gate — wait for LS to confirm its USS IPC reconnect.
+            // 4. Readiness Gate — wait for LS to confirm its USS IPC reconnect.
             //    Returns discovered endpoints so downstream functions don't need
             //    to re-discover (Gate-Once-Pass-Down pattern).
             //    handleAuthRefresh can temporarily kill LS — the gate retries
             //    endpoint discovery inside its loop until LS comes back.
             const { ready, endpoints } = await this.awaitLSReadiness();
 
-            // 6. registerGdmUser — uses gate-provided endpoints (no independent discovery)
+            // 5. registerGdmUser — uses gate-provided endpoints (no independent discovery)
             await this.callRegisterGdmUser(endpoints);
 
-            // 7. Await email confirmation from LS
+            // 6. Await email confirmation from LS (with active registerGdmUser retries)
             const result = await this.pollRichUserStatus(uss, generation, email, endpoints);
             if (!result.confirmed) {
                 log.warn('Email confirmation timed out — LS may not have adopted the new email yet');
@@ -369,7 +365,15 @@ export class AccountSwitchService {
 
                 // Guard: skip if no useful status, already matched, or wrong email
                 if (!userStatus || userStatus.length <= 5 || emailMatched) continue;
-                if (!lsEmail || lsEmail.toLowerCase() !== targetNorm) continue;
+                if (!lsEmail || lsEmail.toLowerCase() !== targetNorm) {
+                    // LS hasn't adopted target email yet: nudge it with registerGdmUser every 5 polls (~4s)
+                    // in case the initial call occurred before LS finished internal reconnect
+                    if (pollCount % 5 === 0) {
+                        log.info(`Poll#${pollCount}: LS still returning ${lsEmail || '(empty)'}, nudging registerGdmUser`);
+                        void this.callRegisterGdmUser(lsProcesses);
+                    }
+                    continue;
+                }
 
                 emailMatched = true;
                 log.info(`FORENSIC EMAIL_MATCH @${elapsed}ms: statusLen=${userStatus.length}B — THIS is pushed to USS`);
