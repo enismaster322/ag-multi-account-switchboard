@@ -68,7 +68,7 @@ export class AccountSwitchService {
     private static readonly LS_READY_POLL_INTERVAL_MS = 400;
 
     // ── Email Confirmation Polling timing ──
-    private static readonly POLL_MAX_WAIT_MS = 12_000;
+    private static readonly POLL_MAX_WAIT_MS = 60_000;
     private static readonly POLL_INTERVAL_MS = 800;
     private static readonly POLL_INITIAL_DELAY_MS = 300;
 
