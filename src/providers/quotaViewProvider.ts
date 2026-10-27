@@ -45,7 +45,7 @@ export class QuotaViewProvider implements vscode.WebviewViewProvider {
                     this.quotaManager.refresh();
                     break;
                 case 'refresh':
-                    this.quotaManager.refresh();
+                    this.quotaManager.refresh(undefined, true);
                     break;
                 case 'setPollInterval':
                     // The host owns the rate: its timer is the one that survives

@@ -60,7 +60,7 @@ export class QuotaManager {
      */
     private currentUsageRange = '24h';
 
-    private cachedServer: { info: ServerInfo | null; ts: number } | null = null;
+    private cachedServer: { info: ServerInfo; ts: number } | null = null;
     private static readonly SERVER_CACHE_TTL = 60_000;
 
     // Global LS port is stable across IDE reloads; separate from workspace LS cache.
@@ -246,11 +246,15 @@ export class QuotaManager {
     // ── Shared server resolution (DRY: used by refresh, refreshTokenOnly, fetchCtxIndependent) ──
 
     private async resolveServer(forceRefresh = false): Promise<ServerInfo | null> {
-        if (!forceRefresh && this.cachedServer && Date.now() - this.cachedServer.ts < QuotaManager.SERVER_CACHE_TTL) {
+        if (!forceRefresh && this.cachedServer?.info && Date.now() - this.cachedServer.ts < QuotaManager.SERVER_CACHE_TTL) {
             return this.cachedServer.info;
         }
         const info = await this.serverDiscovery.discover(this.getWorkspaceId()).catch(() => null);
-        this.cachedServer = { info, ts: Date.now() };
+        if (info) {
+            this.cachedServer = { info, ts: Date.now() };
+        } else {
+            this.cachedServer = null;
+        }
         return info;
     }
 
@@ -388,7 +392,7 @@ export class QuotaManager {
         }
     }
 
-    async refresh(activeEmailHint?: string) {
+    async refresh(activeEmailHint?: string, forceServerRefresh = false) {
         // Suppress refresh during active switch lifecycle to prevent premature renders
         if (this.switchController && !this.switchController.signal.aborted) {
             log.info('refresh: SUPPRESSED (switch lifecycle active)');
@@ -417,7 +421,7 @@ export class QuotaManager {
             const hasData = !!(this.lastLocalData || this.lastTrackedQuotas.length > 0);
             if (this.viewProvider && !hasData) this.viewProvider.setLoading();
 
-            const serverInfo = await this.resolveServer();
+            const serverInfo = await this.resolveServer(forceServerRefresh);
 
 
             const workspaceName = vscode.workspace.workspaceFolders?.[0]?.name ?? '';
@@ -446,8 +450,21 @@ export class QuotaManager {
                 this.harvestModelLabels(localResult);
                 this.logQuotaFractions(localResult);
             } else {
+                const wasLocalMissing = !this.lastLocalData;
                 this.lastLocalData = null;
+                if (serverInfo) {
+                    this.cachedServer = null;
+                }
                 this.statusBar.setError('$(error) Antigravity: Server Not Found', 'Could not connect to local Antigravity server');
+
+                // If Language Server was still booting during initial refresh, retry shortly
+                if (wasLocalMissing) {
+                    setTimeout(() => {
+                        if (!this.lastLocalData && !this.refreshInFlight) {
+                            void this.refresh();
+                        }
+                    }, 3000);
+                }
             }
 
             this.lastTrackedQuotas = trackedResult;
@@ -509,7 +526,7 @@ export class QuotaManager {
             if (hint) {
                 this.refresh(hint);
             } else if (manualPending) {
-                this.refresh();
+                this.refresh(undefined, true);
             }
         }
     }

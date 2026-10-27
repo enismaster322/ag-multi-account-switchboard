@@ -206,8 +206,8 @@ export class ServerDiscoveryService {
             if (!pidMatch) continue;
             const tokenMatch = line.match(CSRF_TOKEN_RE);
             if (!tokenMatch) continue;
-            const wsMatch = line.match(/--workspace_id\s+(\S+)/);
-            const httpsPortMatch = line.match(/--https_server_port\s+(\d+)/);
+            const wsMatch = line.match(/--workspace_id[\s=]+(\S+)/);
+            const httpsPortMatch = line.match(/--https_server_port[\s=]+(\d+)/);
             candidates.push({
                 pid: pidMatch[1],
                 csrfToken: tokenMatch[1],

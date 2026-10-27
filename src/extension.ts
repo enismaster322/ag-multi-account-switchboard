@@ -85,7 +85,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
     // --- Register commands ---
     context.subscriptions.push(
-        vscode.commands.registerCommand('ag.refreshQuota', () => quotaManager.refresh()),
+        vscode.commands.registerCommand('ag.refreshQuota', () => quotaManager.refresh(undefined, true)),
 
         vscode.commands.registerCommand('ag.addAccount', async () => {
             const success = await accountManager.addAccount();
