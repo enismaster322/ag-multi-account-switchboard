@@ -139,7 +139,7 @@ export interface OAuthTokenInfo {
 export interface USSApi {
     OAuthPreferences: {
         setOAuthTokenInfo(info: OAuthTokenInfo): Promise<void>;
-        getOAuthTokenInfo(): Promise<string | null>;
+        getOAuthTokenInfo(): Promise<OAuthTokenInfo | string | null>;
     };
     UserStatus: {
         getUserStatus(): Promise<string | null>;

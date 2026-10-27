@@ -84,14 +84,38 @@ export async function findLSEndpoints(): Promise<LsEndpoint[]> {
             lines = stdout.trim().split('\n').filter(Boolean);
         }
 
-        return lines.flatMap(line => {
+        const results: LsEndpoint[] = [];
+        for (const line of lines) {
             const pidMatch = line.trim().match(/^(\d+)\s/);
             const pid = pidMatch ? parseInt(pidMatch[1], 10) : undefined;
             const port = line.match(/--https_server_port[=\s]+(\d+)/)?.[1];
             const csrf = line.match(CSRF_TOKEN_RE)?.[1];
             const wsId = line.match(/--workspace_id[=\s]+(\S+)/)?.[1];
-            return port && csrf ? [{ port: +port, csrf, wsId, pid }] : [];
-        });
+            if (!csrf) continue;
+
+            if (port) {
+                results.push({ port: +port, csrf, wsId, pid });
+                continue;
+            }
+
+            // Fallback: If --https_server_port wasn't passed in args (e.g. cold start),
+            // detect listening TCP ports via lsof
+            if (pid && !isWindows) {
+                try {
+                    const { stdout: lsofOut } = await execAsync(
+                        `lsof -Pan -p ${pid} -i TCP -sTCP:LISTEN 2>/dev/null`,
+                        { timeout: 2000 }
+                    );
+                    for (const lsofLine of lsofOut.split('\n')) {
+                        const m = lsofLine.match(/:(\d+)\s+\(LISTEN\)/);
+                        if (m) {
+                            results.push({ port: parseInt(m[1], 10), csrf, wsId, pid });
+                        }
+                    }
+                } catch { /* ignore lsof errors */ }
+            }
+        }
+        return results;
     } catch { /* expected: process discovery failure */
         return [];
     }
@@ -129,11 +153,13 @@ export function loadLSCert(): Buffer | undefined {
  * @param endpoint - Full gRPC path, e.g.
  *                   '/exa.language_server_pb.LanguageServerService/RegisterGdmUser'
  * @param ca       - Optional CA cert.  If omitted TLS verification is skipped.
+ * @param payload  - Optional request protobuf body.
  */
 export function callLSEndpoint(
     ls: LsEndpoint,
     endpoint: string,
     ca?: Buffer,
+    payload?: Buffer,
 ): Promise<Buffer> {
     return new Promise((resolve, reject) => {
         const req = https.request(
@@ -146,7 +172,7 @@ export function callLSEndpoint(
                     'Content-Type': 'application/proto',
                     'Connect-Protocol-Version': '1',
                     'x-codeium-csrf-token': ls.csrf,
-                    'Content-Length': '0',
+                    'Content-Length': payload ? String(payload.length) : '0',
                 },
                 ...(ca ? { ca, rejectUnauthorized: true } : { rejectUnauthorized: false }),
             },
@@ -163,6 +189,9 @@ export function callLSEndpoint(
         );
         req.on('error', reject);
         req.setTimeout(LS_REQUEST_TIMEOUT_MS, () => req.destroy(new Error('LS request timed out')));
+        if (payload) {
+            req.write(payload);
+        }
         req.end();
     });
 }

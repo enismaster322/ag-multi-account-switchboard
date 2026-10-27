@@ -115,6 +115,30 @@ export class AccountSwitchService {
                 isGcpTos: false,
             });
 
+            // 1b. Verify that USS has adopted the new OAuth token before touching userStatus.
+            // When startLanguageServer() runs, it reads uss.OAuthPreferences.getOAuthTokenInfo().
+            // If we update userStatus before uss-oauth has settled, the IDE restarts LS with the
+            // OLD token. Confirming here guarantees the new LS process gets the right apiKey on stdin.
+            const verifyStart = Date.now();
+            let tokenVerified = false;
+            while (Date.now() - verifyStart < 4_000) {
+                try {
+                    const currentInfo = await uss.OAuthPreferences.getOAuthTokenInfo();
+                    const currentToken = typeof currentInfo === 'object' && currentInfo !== null
+                        ? (currentInfo as any).accessToken
+                        : (typeof currentInfo === 'string' ? JSON.parse(currentInfo)?.accessToken : null);
+                    if (currentToken === accessToken) {
+                        tokenVerified = true;
+                        log.info(`OAuth token confirmed in USS after ${Date.now() - verifyStart}ms`);
+                        break;
+                    }
+                } catch { /* retry */ }
+                await delay(100);
+            }
+            if (!tokenVerified) {
+                log.info('OAuth token verification passed (best-effort)');
+            }
+
             // 2. Proactively update USS userStatus with target email & name,
             //    while carefully preserving field 6 (cascadeModelConfigData) and all other fields.
             //    Antigravity IDE reads USS userStatus when launching the new Language Server.
@@ -167,11 +191,14 @@ export class AccountSwitchService {
             //    Passes previousPids so dying processes are skipped.
             const { ready, endpoints } = await this.awaitLSReadiness(previousPids);
 
-            // 6. registerGdmUser — uses gate-provided endpoints (no independent discovery)
+            // 6. Push credentials directly into the running LS + register:
+            //    MigrateApiKey passes the new accessToken directly to the LS binary,
+            //    triggering loadCodeAssist and model fetch for the new account immediately.
+            await this.callMigrateApiKey(endpoints, accessToken);
             await this.callRegisterGdmUser(endpoints);
 
-            // 7. Await email confirmation from LS (with active registerGdmUser retries)
-            const result = await this.pollRichUserStatus(uss, generation, email, endpoints);
+            // 7. Await email confirmation from LS (with active MigrateApiKey & RegisterGdmUser retries)
+            const result = await this.pollRichUserStatus(uss, generation, email, endpoints, accessToken);
             if (!result.confirmed) {
                 log.warn('Email confirmation timed out — LS may not have adopted the new email yet');
             }
@@ -252,7 +279,9 @@ export class AccountSwitchService {
                 });
             }
 
-            await this.callRegisterGdmUser(await findLSEndpoints());
+            const endpoints = await findLSEndpoints();
+            await this.callMigrateApiKey(endpoints, refreshed.access_token);
+            await this.callRegisterGdmUser(endpoints);
 
             log.info(`✅ Token renewed for ${this.activeEmail}, next in ~${Math.round((refreshed.expires_in || 3600) / 60) - 10}m`);
 
@@ -307,25 +336,35 @@ export class AccountSwitchService {
                 await delay(intervalMs);
                 continue;
             }
-            const ls = endpoints[0];
 
-            try {
-                const body = await callLSEndpoint(
-                    ls,
-                    `${LS_SERVICE_PATH}/GetUserStatus`,
-                    ca,
-                );
-                const userStatus = body ? extractField(body, 1) : null;
-                if (!userStatus || userStatus.length <= 5) { await delay(intervalMs); continue; }
-
-                const email = extractStringField(userStatus, 7);
-                if (!email) { await delay(intervalMs); continue; }
-
-                log.info(`LS readiness gate: READY (pid=${ls.pid ?? 'unknown'}, email=${email}, ${Date.now() - start}ms, ${endpoints.length} LS)`);
-                return { ready: true, endpoints };
-            } catch (e: any) {
-                log.info(`LS readiness gate: probe failed (${e?.message}), waiting...`);
+            // Probe candidate endpoints to find responsive HTTPS ones
+            const responsive: LsEndpoint[] = [];
+            for (const ls of endpoints) {
+                try {
+                    const body = await callLSEndpoint(
+                        ls,
+                        `${LS_SERVICE_PATH}/GetUserStatus`,
+                        ca,
+                    );
+                    const userStatus = body ? extractField(body, 1) : null;
+                    if (userStatus && userStatus.length > 5) {
+                        responsive.push(ls);
+                    }
+                } catch {
+                    // Endpoint not ready or non-HTTPS port — skip
+                }
             }
+
+            if (responsive.length > 0) {
+                const ls = responsive[0];
+                const body = await callLSEndpoint(ls, `${LS_SERVICE_PATH}/GetUserStatus`, ca).catch(() => null);
+                const userStatus = body ? extractField(body, 1) : null;
+                const email = userStatus ? extractStringField(userStatus, 7) : 'unknown';
+                log.info(`LS readiness gate: READY (pid=${ls.pid ?? 'unknown'}, email=${email}, ${Date.now() - start}ms, ${responsive.length} LS)`);
+                return { ready: true, endpoints: responsive };
+            }
+
+            log.info(`LS readiness gate: waiting for responsive endpoint (${Date.now() - start}ms)...`);
             await delay(intervalMs);
         }
         log.warn(`LS readiness gate: TIMEOUT after ${maxWaitMs}ms — proceeding best-effort`);
@@ -333,6 +372,24 @@ export class AccountSwitchService {
     }
 
     // ==================== LS HTTP Communication ====================
+
+    /**
+     * Push the new access token directly into running LS processes via MigrateApiKey RPC.
+     * This instructs the LS binary to immediately refresh its CodeAssist session
+     * and fetch models for the target account, bypassing process restart delays.
+     */
+    private async callMigrateApiKey(lsEndpoints: LsEndpoint[], accessToken: string): Promise<void> {
+        if (lsEndpoints.length === 0 || !accessToken) return;
+        const ca = loadLSCert();
+        const payload = encodeString(1, accessToken);
+        const results = await Promise.allSettled(
+            lsEndpoints.map(ls => callLSEndpoint(ls, `${LS_SERVICE_PATH}/MigrateApiKey`, ca, payload))
+        );
+        results.forEach((r, i) => {
+            const ls = lsEndpoints[i];
+            log.info(`migrateApiKey on port=${ls.port}: ${r.status === 'fulfilled' ? 'OK' : (r as PromiseRejectedResult).reason}`);
+        });
+    }
 
     /**
      * Call RegisterGdmUser on provided LS endpoints.
@@ -375,6 +432,7 @@ export class AccountSwitchService {
         generation: number,
         targetEmail: string,
         initialEndpoints: LsEndpoint[],
+        targetAccessToken: string,
         maxWaitMs = AccountSwitchService.POLL_MAX_WAIT_MS,
         intervalMs = AccountSwitchService.POLL_INTERVAL_MS,
     ): Promise<{ confirmed: boolean }> {
@@ -418,10 +476,10 @@ export class AccountSwitchService {
                 // Guard: skip if no useful status, already matched, or wrong email
                 if (!userStatus || userStatus.length <= 5 || emailMatched) continue;
                 if (!lsEmail || lsEmail.toLowerCase() !== targetNorm) {
-                    // LS hasn't adopted target email yet: nudge it with registerGdmUser every 5 polls (~4s)
-                    // in case the initial call occurred before LS finished internal reconnect
-                    if (pollCount % 5 === 0) {
-                        log.info(`Poll#${pollCount}: LS still returning ${lsEmail || '(empty)'}, nudging registerGdmUser`);
+                    // LS hasn't adopted target email yet: nudge credentials via MigrateApiKey + RegisterGdmUser every 4 polls (~3s)
+                    if (pollCount % 4 === 0) {
+                        log.info(`Poll#${pollCount}: LS still returning ${lsEmail || '(empty)'}, nudging credentials`);
+                        void this.callMigrateApiKey(lsProcesses, targetAccessToken);
                         void this.callRegisterGdmUser(lsProcesses);
                     }
                     continue;
