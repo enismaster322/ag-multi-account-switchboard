@@ -64,11 +64,11 @@ export class AccountSwitchService {
     private static readonly MAX_TIMEOUT_MS = 2_147_483_647;
 
     // ── LS Readiness Gate timing ──
-    private static readonly LS_READY_MAX_WAIT_MS = 8_000;
+    private static readonly LS_READY_MAX_WAIT_MS = 20_000;
     private static readonly LS_READY_POLL_INTERVAL_MS = 400;
 
     // ── Email Confirmation Polling timing ──
-    private static readonly POLL_MAX_WAIT_MS = 60_000;
+    private static readonly POLL_MAX_WAIT_MS = 25_000;
     private static readonly POLL_INTERVAL_MS = 800;
     private static readonly POLL_INITIAL_DELAY_MS = 300;
 
@@ -420,8 +420,10 @@ export class AccountSwitchService {
         let lastSize = initialSize;
         let stableCount = 0;
         const start = Date.now();
+        // Cap background stabilization to at most 10 seconds
+        const maxStabilizeMs = Math.min(remainingMs, 10_000);
 
-        while (Date.now() - start < remainingMs) {
+        while (Date.now() - start < maxStabilizeMs) {
             if (generation !== this.switchGeneration) return;
             await delay(intervalMs);
 
@@ -448,7 +450,13 @@ export class AccountSwitchService {
                 lastSize = userStatus.length;
                 stableCount = 0;
             } catch (e: any) {
-                log.warn('USS stabilize iteration failed:', e?.message);
+                const msg = e?.message || '';
+                // If CSRF rotated, session dropped, or LS restarted, abort stabilization immediately
+                if (msg.includes('401') || msg.includes('CSRF') || msg.includes('unauthenticated') || msg.includes('ECONNREFUSED')) {
+                    log.info(`USS stabilize stopped: ${msg}`);
+                    return;
+                }
+                log.warn('USS stabilize iteration failed:', msg);
             }
         }
     }
