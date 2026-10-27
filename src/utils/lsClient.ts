@@ -52,12 +52,14 @@ export async function getWindowsProcessLines(grep: string): Promise<string[]> {
     }
 }
 
-/** { port, csrf, wsId } tuple extracted from a running Language Server process */
+/** { port, csrf, wsId, pid } tuple extracted from a running Language Server process */
 export interface LsEndpoint {
     port: number;
     csrf: string;
     /** workspace_id from LS process args — used to match the active workspace */
     wsId?: string;
+    /** Process ID of the running Language Server */
+    pid?: number;
 }
 
 // ==================== Process Discovery ====================
@@ -76,19 +78,21 @@ export async function findLSEndpoints(): Promise<LsEndpoint[]> {
             lines = await getWindowsProcessLines(LS_PROCESS_GREP);
         } else {
             const { stdout } = await execAsync(
-                `ps -A -ww -o args | grep "${LS_PROCESS_GREP}" | grep -v grep`,
+                `ps -A -ww -o pid,args | grep "${LS_PROCESS_GREP}" | grep -v grep`,
                 { timeout: LSOF_EXEC_TIMEOUT_MS },
             );
             lines = stdout.trim().split('\n').filter(Boolean);
         }
 
         return lines.flatMap(line => {
+            const pidMatch = line.trim().match(/^(\d+)\s/);
+            const pid = pidMatch ? parseInt(pidMatch[1], 10) : undefined;
             const port = line.match(/--https_server_port[=\s]+(\d+)/)?.[1];
             const csrf = line.match(CSRF_TOKEN_RE)?.[1];
             const wsId = line.match(/--workspace_id[=\s]+(\S+)/)?.[1];
-            return port && csrf ? [{ port: +port, csrf, wsId }] : [];
+            return port && csrf ? [{ port: +port, csrf, wsId, pid }] : [];
         });
-    } catch { /* expected: JSON parse failure — raw text response */
+    } catch { /* expected: process discovery failure */
         return [];
     }
 }

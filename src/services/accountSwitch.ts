@@ -5,6 +5,7 @@ import { getUSS } from '../utils/uss';
 import {
     encodeString, encodeVarintField,
     encodeMessage, extractField, extractStringField,
+    stripFieldFromProtobuf, encodeStringField,
 } from '../shared/protobuf';
 import { createLogger } from '../utils/logger';
 import { dbExec } from '../shared/db';
@@ -114,10 +115,45 @@ export class AccountSwitchService {
                 isGcpTos: false,
             });
 
-            // 2. Legacy auth status JSON (safe — no SQL injection, async to not block)
+            // 2. Proactively update USS userStatus with target email & name,
+            //    while carefully preserving field 6 (cascadeModelConfigData) and all other fields.
+            //    Antigravity IDE reads USS userStatus when launching the new Language Server.
+            try {
+                let userStatusBuf: Buffer | null = null;
+                const rawStatus = await uss.UserStatus?.getUserStatus?.().catch(() => null);
+                if (rawStatus) {
+                    userStatusBuf = typeof rawStatus === 'string'
+                        ? Buffer.from(rawStatus, 'base64')
+                        : Buffer.from(rawStatus);
+                }
+
+                if (userStatusBuf && userStatusBuf.length > 10) {
+                    let updatedStatus = stripFieldFromProtobuf(userStatusBuf, 7);
+                    updatedStatus = stripFieldFromProtobuf(updatedStatus, 3);
+                    updatedStatus = Buffer.concat([
+                        updatedStatus,
+                        encodeStringField(7, email),
+                        encodeStringField(3, name),
+                    ]);
+                    await this.pushUserStatusToUSS(uss, updatedStatus);
+                    log.info(`Pushed updated UserStatus to USS (${userStatusBuf.length}B -> ${updatedStatus.length}B, email=${email})`);
+                } else {
+                    await uss.pushSerializedUpdateIPC(this.buildUserStatusUpdate(name, email));
+                    log.info(`Pushed initial UserStatus to USS (email=${email})`);
+                }
+            } catch (e: any) {
+                log.warn('Pre-refresh USS UserStatus update failed (non-fatal):', e?.message);
+            }
+
+            // 3. Legacy auth status JSON (safe — no SQL injection, async to not block)
             this.writeAuthStatusToDb(name, email, accessToken);
 
-            // 3. handleAuthRefresh — fires IDE's createSession + sessionChangeEmitter.
+            // Record current LS PIDs so the readiness gate waits for the fresh process
+            const currentEndpoints = await findLSEndpoints();
+            const previousPids = new Set(currentEndpoints.map(e => e.pid).filter((p): p is number => p !== undefined));
+            log.info(`Switch: current LS PIDs=[${Array.from(previousPids).join(', ')}], triggering handleAuthRefresh`);
+
+            // 4. handleAuthRefresh — fires IDE's createSession + sessionChangeEmitter.
             //    This propagates the new token context to LS via USS IPC notification,
             //    ensuring LS is aware of the new session BEFORE we call registerGdmUser.
             try {
@@ -127,17 +163,14 @@ export class AccountSwitchService {
                 log.warn('handleAuthRefresh failed (non-fatal):', e?.message);
             }
 
-            // 4. Readiness Gate — wait for LS to confirm its USS IPC reconnect.
-            //    Returns discovered endpoints so downstream functions don't need
-            //    to re-discover (Gate-Once-Pass-Down pattern).
-            //    handleAuthRefresh can temporarily kill LS — the gate retries
-            //    endpoint discovery inside its loop until LS comes back.
-            const { ready, endpoints } = await this.awaitLSReadiness();
+            // 5. Readiness Gate — wait for the NEW LS process to confirm its USS IPC reconnect.
+            //    Passes previousPids so dying processes are skipped.
+            const { ready, endpoints } = await this.awaitLSReadiness(previousPids);
 
-            // 5. registerGdmUser — uses gate-provided endpoints (no independent discovery)
+            // 6. registerGdmUser — uses gate-provided endpoints (no independent discovery)
             await this.callRegisterGdmUser(endpoints);
 
-            // 6. Await email confirmation from LS (with active registerGdmUser retries)
+            // 7. Await email confirmation from LS (with active registerGdmUser retries)
             const result = await this.pollRichUserStatus(uss, generation, email, endpoints);
             if (!result.confirmed) {
                 log.warn('Email confirmation timed out — LS may not have adopted the new email yet');
@@ -251,6 +284,7 @@ export class AccountSwitchService {
      * going down after handleAuthRefresh.
      */
     private async awaitLSReadiness(
+        previousPids: Set<number> = new Set(),
         maxWaitMs = AccountSwitchService.LS_READY_MAX_WAIT_MS,
         intervalMs = AccountSwitchService.LS_READY_POLL_INTERVAL_MS,
     ): Promise<{ ready: boolean; endpoints: LsEndpoint[] }> {
@@ -258,9 +292,18 @@ export class AccountSwitchService {
         const start = Date.now();
 
         while (Date.now() - start < maxWaitMs) {
-            const endpoints = await findLSEndpoints();
+            const allEndpoints = await findLSEndpoints();
+            let endpoints = previousPids.size > 0
+                ? allEndpoints.filter(e => e.pid === undefined || !previousPids.has(e.pid))
+                : allEndpoints;
+
+            // Fallback: If after 5s no new PID appeared, fall back to allEndpoints
+            if (endpoints.length === 0 && Date.now() - start > 5_000 && allEndpoints.length > 0) {
+                endpoints = allEndpoints;
+            }
+
             if (endpoints.length === 0) {
-                log.info(`LS readiness gate: no endpoints yet (${Date.now() - start}ms), retrying...`);
+                log.info(`LS readiness gate: waiting for new LS process (${Date.now() - start}ms)...`);
                 await delay(intervalMs);
                 continue;
             }
@@ -278,7 +321,7 @@ export class AccountSwitchService {
                 const email = extractStringField(userStatus, 7);
                 if (!email) { await delay(intervalMs); continue; }
 
-                log.info(`LS readiness gate: READY (email=${email}, ${Date.now() - start}ms, ${endpoints.length} LS)`);
+                log.info(`LS readiness gate: READY (pid=${ls.pid ?? 'unknown'}, email=${email}, ${Date.now() - start}ms, ${endpoints.length} LS)`);
                 return { ready: true, endpoints };
             } catch (e: any) {
                 log.info(`LS readiness gate: probe failed (${e?.message}), waiting...`);
