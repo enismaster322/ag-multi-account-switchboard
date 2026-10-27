@@ -64,7 +64,7 @@ export class AccountSwitchService {
     private static readonly MAX_TIMEOUT_MS = 2_147_483_647;
 
     // ── LS Readiness Gate timing ──
-    private static readonly LS_READY_MAX_WAIT_MS = 20_000;
+    private static readonly LS_READY_MAX_WAIT_MS = 45_000;
     private static readonly LS_READY_POLL_INTERVAL_MS = 400;
 
     // ── Email Confirmation Polling timing ──
@@ -336,9 +336,8 @@ export class AccountSwitchService {
         intervalMs = AccountSwitchService.POLL_INTERVAL_MS,
     ): Promise<{ confirmed: boolean }> {
         let lsProcesses = initialEndpoints.length > 0 ? initialEndpoints : await findLSEndpoints();
-        if (lsProcesses.length === 0) return { confirmed: false };
         const ca = loadLSCert();
-        let ls = lsProcesses[0];
+        let ls = lsProcesses.length > 0 ? lsProcesses[0] : null;
 
         let emailMatched = false;
         const targetNorm = targetEmail.toLowerCase();
@@ -354,6 +353,16 @@ export class AccountSwitchService {
             }
 
             pollCount++;
+
+            if (!ls) {
+                lsProcesses = await findLSEndpoints();
+                if (lsProcesses.length > 0) ls = lsProcesses[0];
+                if (!ls) {
+                    await delay(intervalMs);
+                    continue;
+                }
+            }
+
             try {
                 const body = await callLSEndpoint(ls, `${LS_SERVICE_PATH}/GetUserStatus`, ca);
                 const userStatus = body ? extractField(body, 1) : null;
@@ -379,7 +388,6 @@ export class AccountSwitchService {
                 log.info(`FORENSIC EMAIL_MATCH @${elapsed}ms: statusLen=${userStatus.length}B — THIS is pushed to USS`);
 
                 await this.pushUserStatusToUSS(uss, userStatus);
-                await vscode.commands.executeCommand('antigravity.handleAuthRefresh');
 
                 // Continue USS stabilization in background (profile pic, data growth)
                 this.stabilizeUSS(uss, ls, ca, generation, userStatus.length, intervalMs, maxWaitMs - (Date.now() - start))
@@ -390,10 +398,10 @@ export class AccountSwitchService {
                 const msg = e?.message || '';
                 log.info(`FORENSIC poll#${pollCount} ERROR: ${msg}`);
                 // CSRF token regenerated after registerGdmUser — re-discover endpoints
-                if (msg.includes('401') || msg.includes('CSRF') || msg.includes('unauthenticated')) {
-                    log.info('Poll: CSRF invalid, re-discovering LS endpoints');
+                if (msg.includes('401') || msg.includes('CSRF') || msg.includes('unauthenticated') || msg.includes('ECONNREFUSED')) {
+                    log.info('Poll: CSRF invalid or connection refused, re-discovering LS endpoints');
                     lsProcesses = await findLSEndpoints();
-                    if (lsProcesses.length > 0) ls = lsProcesses[0];
+                    ls = lsProcesses.length > 0 ? lsProcesses[0] : null;
                 } else {
                     log.warn('UserStatus poll iteration failed:', msg);
                 }
@@ -445,7 +453,6 @@ export class AccountSwitchService {
                 }
 
                 await this.pushUserStatusToUSS(uss, userStatus);
-                await vscode.commands.executeCommand('antigravity.handleAuthRefresh');
                 log.info(`USS stabilize: grew ${lastSize} → ${userStatus.length}B`);
                 lastSize = userStatus.length;
                 stableCount = 0;
