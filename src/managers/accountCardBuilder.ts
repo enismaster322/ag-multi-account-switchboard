@@ -181,9 +181,17 @@ export function buildAccountCards(
             switchActive
         );
 
+        // If local card corresponds to a tracked account, retain its trackingId
+        // so action buttons (Copy Token, Switch, Remove) remain functional
+        const matchingTracked = trackedQuotas.find(
+            t => (t.account.email || '').toLowerCase() === localEmail
+        );
+
         cards.push({
             email: status.email || 'active-local',
+            name: matchingTracked?.account.name,
             isActive: !activeEmail || activeEmail === localEmail,
+            trackingId: matchingTracked?.account.id,
             isTransitioning,
             pendingEmail: isTransitioning ? activeEmailRaw : undefined,
             hasOpus55,
